@@ -1,85 +1,142 @@
-import requests
-import getopt
 import sys
+import time
+import requests
+import re
 import subprocess
+import platform
 
-# Función para mostrar ayuda
+# Mensaje de ayuda que se muestra al usuario
+MENSAJE_AYUDA = '''Uso: python OUILookup.py --mac <mac> | --arp | [--help]
+--mac: MAC a consultar. P.e. aa:bb:cc:00:00:00.
+--arp: muestra los fabricantes de los hosts disponibles en la tabla ARP.
+--help: muestra este mensaje y termina.
+'''
+
+def obtener_fabricante(direccion_mac):
+    # Normalizar la dirección MAC eliminando caracteres que no sean hexadecimales
+    mac_limpia = re.sub('[^A-Fa-fA-F0-9]', '', direccion_mac)
+    # Verificar que la dirección MAC tenga al menos 6 caracteres (3 bytes)
+    if len(mac_limpia) < 6:
+        print("Dirección MAC inválida:", direccion_mac)
+        return "Dirección MAC inválida", 0
+    # Construir la URL para consultar el fabricante en la API
+    url = f'https://api.maclookup.app/v2/macs/{direccion_mac}'
+    tiempo_inicio = time.time()
+    try:
+        # Realizar la solicitud HTTP a la API
+        respuesta = requests.get(url)
+        # Calcular el tiempo de respuesta en milisegundos
+        tiempo_respuesta = int((time.time() - tiempo_inicio) * 1000)
+        if respuesta.status_code == 200:
+            datos = respuesta.json()
+            if datos.get('found'):
+                # Obtener el nombre del fabricante
+                fabricante = datos.get('company', 'No encontrado')
+            else:
+                fabricante = 'No encontrado'
+        else:
+            fabricante = 'No encontrado'
+    except Exception as e:
+        # En caso de error, asignar 'No encontrado' y calcular el tiempo de respuesta
+        fabricante = 'No encontrado'
+        tiempo_respuesta = int((time.time() - tiempo_inicio) * 1000)
+    return fabricante, tiempo_respuesta
+
+def obtener_tabla_arp():
+    # Determinar el sistema operativo
+    tipo_os = platform.system()
+    cmd = ['arp', '-a']
+    try:
+        if tipo_os == 'Windows':
+            # En Windows, usar codificación 'mbcs'
+            salida = subprocess.check_output(cmd, encoding='mbcs', errors='ignore')
+        else:
+            # En otros sistemas, usar codificación 'utf-8'
+            salida = subprocess.check_output(cmd, encoding='utf-8', errors='ignore')
+    except Exception as e:
+        print("Error ejecutando el comando arp:", e)
+        return []
+    # Analizar la salida del comando ARP
+    entradas = []
+    if tipo_os == 'Windows':
+        entradas = analizar_arp_windows(salida)
+    else:
+        entradas = analizar_arp_linux(salida)
+    return entradas
+
+def analizar_arp_windows(salida):
+    entradas = []
+    # Dividir la salida en líneas
+    lineas = salida.split('\n')
+    for linea in lineas:
+        linea = linea.strip()
+        # Ignorar líneas que no contienen información relevante
+        if linea.startswith('Interface:') or linea.startswith('Interfaz:'):
+            continue
+        if ('Internet Address' in linea or 'Dirección de Internet' in linea or
+            'Physical Address' in linea or 'Dirección física' in linea or
+            'Type' in linea or 'Tipo' in linea):
+            continue
+        if linea:
+            # Dividir la línea en partes
+            partes = linea.split()
+            if len(partes) >= 2:
+                ip = partes[0]
+                # Reemplazar guiones por dos puntos en la dirección MAC
+                mac = partes[1].replace('-', ':')
+                entradas.append((ip, mac))
+    return entradas
+
+def analizar_arp_linux(salida):
+    entradas = []
+    # Dividir la salida en líneas
+    lineas = salida.split('\n')
+    for linea in lineas:
+        # Utilizar expresión regular para extraer IP y MAC
+        match = re.match(r'.*\(([\d\.]+)\) at ([0-9a-fA-F:]+) ', linea)
+        if match:
+            ip = match.group(1)
+            mac = match.group(2)
+            entradas.append((ip, mac))
+    return entradas
+
 def mostrar_ayuda():
-    print("Uso: python OUILookup.py --mac <mac> | --arp | [--help]")
-    print(" --mac: MAC a consultar. P.e. aa:bb:cc:00:00:00.")
-    print(" --arp: muestra los fabricantes de los host disponibles en la tabla ARP.")
-    print(" --help: muestra este mensaje y termina.")
-    sys.exit()
+    # Imprimir el mensaje de ayuda al usuario
+    print(MENSAJE_AYUDA)
 
-# Función para verificar si una MAC es multicast o broadcast
-def es_multicast_o_broadcast(mac):
-    if mac.startswith("ff:ff:ff") or mac.startswith("01:00:5e"):
-        return True
-    return False
-
-# Función para consultar fabricante usando una MAC
-def consultar_fabricante(mac):
-    url = f"https://api.maclookup.app/v2/macs/{mac}"
-    try:
-        response = requests.get(url)
-        if response.status_code == 200:
-            data = response.json()
-            # Asegurar que el fabricante sea "Not Found" si no existe o si es una cadena vacía
-            fabricante = data.get("company", "Not Found")
-            if not fabricante:  # Si el valor está vacío o no es válido
-                fabricante = "Not Found"
-            tiempo_respuesta = response.elapsed.total_seconds()  # Obtener el tiempo de respuesta
-            return fabricante, tiempo_respuesta
-        else:
-            return "Not Found", response.elapsed.total_seconds()
-    except Exception as e:
-        return f"Error: {e}", 0
-
-# Función para obtener la tabla ARP en Windows y consultar el fabricante
-def obtener_arp():
-    try:
-        output = subprocess.check_output("arp -a", shell=True).decode('cp1252')
-        output = output.replace("din mico", "dinámico").replace("est tico", "estático")
-        print("IP/MAC/Fabricante/Tipo:")
-        for line in output.splitlines():
-            if "incompl" not in line and "-" in line:
-                parts = line.split()
-                mac_address = parts[1].replace("-", ":")  # Convertir el formato MAC a formato con ":"
-                tipo_direccion = parts[-1]  # Última palabra que indica si es dinámico o estático
-
-                # Verificar si es multicast o broadcast
-                if es_multicast_o_broadcast(mac_address):
-                    fabricante = "N/A (Multicast/Broadcast)"
-                else:
-                    fabricante, _ = consultar_fabricante(mac_address)
-                
-                print(f"{parts[0]} / {mac_address} / {fabricante} / {tipo_direccion}")
-    except Exception as e:
-        print(f"Error al obtener la tabla ARP: {e}")
-
-# Función principal para procesar los argumentos de línea de comandos
 def main():
-    try:
-        opts, args = getopt.getopt(sys.argv[1:], "", ["mac=", "arp", "help"])
-    except getopt.GetoptError as err:
-        print(str(err))
+    # Si no hay argumentos o se solicita ayuda, mostrar el mensaje de ayuda
+    if len(sys.argv) <= 1 or '--help' in sys.argv:
+        mostrar_ayuda()
+        return
+    if '--mac' in sys.argv:
+        # Obtener el índice del argumento '--mac'
+        idx = sys.argv.index('--mac')
+        if idx + 1 >= len(sys.argv):
+            # Si no se proporciona una dirección MAC después de '--mac'
+            print("Dirección MAC no proporcionada.")
+            mostrar_ayuda()
+            return
+        direccion_mac = sys.argv[idx + 1]
+        # Obtener el fabricante y el tiempo de respuesta
+        fabricante, tiempo_respuesta = obtener_fabricante(direccion_mac)
+        # Mostrar los resultados
+        print(f"Dirección MAC : {direccion_mac}")
+        print(f"Fabricante : {fabricante}")
+        print(f"Tiempo de respuesta: {tiempo_respuesta}ms")
+    elif '--arp' in sys.argv:
+        # Obtener las entradas de la tabla ARP
+        entradas = obtener_tabla_arp()
+        # Mostrar encabezado
+        print("IP / MAC / Fabricante / Tiempo de respuesta:")
+        for ip, mac in entradas:
+            # Obtener el fabricante y el tiempo de respuesta para cada entrada
+            fabricante, tiempo_respuesta = obtener_fabricante(mac)
+            # Mostrar los resultados
+            print(f"{ip} / {mac} / {fabricante} / {tiempo_respuesta}ms")
+    else:
+        # Si se proporcionan argumentos no reconocidos, mostrar ayuda
         mostrar_ayuda()
 
-    if not opts:
-        mostrar_ayuda()
-
-    for opt, arg in opts:
-        if opt == "--mac":
-            fabricante, tiempo_respuesta = consultar_fabricante(arg)
-            print(f"MAC address: {arg}")
-            print(f"Fabricante: {fabricante}")
-            print(f"Tiempo de respuesta: {tiempo_respuesta} segundos")
-        elif opt == "--arp":
-            obtener_arp()
-        elif opt == "--help":
-            mostrar_ayuda()
-        else:
-            mostrar_ayuda()
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
